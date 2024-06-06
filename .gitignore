@@ -1,0 +1,17 @@
+.eunit
+deps
+*.o
+*.beam
+*.plt
+*.swp
+*.tar.gz
+erl_crash.dump
+ebin
+rel/example_project
+.rebar
+rebar.lock
+log/
+_build/
+rebar3
+*.crashdump
+_checkouts/
