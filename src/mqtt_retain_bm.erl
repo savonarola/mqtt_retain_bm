@@ -1,8 +1,8 @@
 -module(mqtt_retain_bm).
 
--export([main/1]).
+-export([main/1, wake_up/0]).
 
--define(OPTS, [
+-define(PUB_OPTS, [
     {hosts, $h, "hosts", {string, "localhost"},
         "mqtt server hostname or comma-separated hostnames"},
     {port, $p, "port", {integer, 1883}, "mqtt server port number"},
@@ -19,43 +19,77 @@
     {payload_size, undefined, "payload_size", {integer, 8192}, "payload size in bytes"},
     {start_interval, undefined, "start_interval", {integer, 50},
         "client start interval in milliseconds"},
-    {ifaddrs, undefined, "ifaddrs", {string, ""},
-        "network interfaces address to bind"},
+    {ifaddrs, undefined, "ifaddrs", {string, ""}, "network interfaces address to bind"},
     {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
     {help, $?, "help", {boolean, false}, "display this help message"}
 ]).
 
-main(Args) ->
-    case parse_opts(Args) of
+-define(SUB_OPTS, [
+    {hosts, $h, "hosts", {string, "localhost"},
+        "mqtt server hostname or comma-separated hostnames"},
+    {port, $p, "port", {integer, 1883}, "mqtt server port number"},
+    {clientid_prefix, undefined, "clientid_prefix", {string, "mqtt_retain_bm"},
+        "mqtt clientid prefix"},
+    {topic, $t, "topic", {string, "config/{docid}/{partid}"},
+        "mqtt topic pattern, {docid} and {partid} will be substituted"},
+    {docid_start, undefined, "docid_start", {integer, 1}, "start of docid range"},
+    {docid_end, undefined, "docid_end", {integer, 100}, "end of docid range"},
+    {partid_start, undefined, "partid_start", {integer, 1}, "start of partid range"},
+    {partid_end, undefined, "partid_end", {integer, 16}, "end of partid range"},
+    {duration, undefined, "duration", {integer, 15 * 60},
+        "time to subscribe to all documents in seconds"},
+    {part_receive_timeout, undefined, "part_receive_timeout", {integer, 16000},
+        "timeout to receive all parts of a document in milliseconds"},
+    {ifaddrs, undefined, "ifaddrs", {string, ""}, "network interfaces address to bind"},
+    {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
+    {terminate_clients, undefined, "terminate_clients", {boolean, false},
+        "terminate clients after all parts received"},
+    {help, $?, "help", {boolean, false}, "display this help message"}
+]).
+
+main(["pub" | Args]) ->
+    with_parsed_options(pub, ?PUB_OPTS, Args, fun run_pub/1);
+main(["sub" | Args]) ->
+    with_parsed_options(sub, ?SUB_OPTS, Args, fun run_sub/1);
+main(_) ->
+    io:format("usage: ~p [pub|sub]~n", [?MODULE]),
+    halt(1).
+
+with_parsed_options(Action, OptSpecs, Args, Fun) ->
+    case parse_opts(Action, OptSpecs, Args) of
         {ok, Opts} ->
             case maps:get(help, Opts) of
                 true ->
-                    getopt:usage(?OPTS, atom_to_list(?MODULE));
+                    getopt:usage(OptSpecs, command_name(Action));
                 false ->
-                    run(Opts)
+                    Fun(Opts)
             end,
             halt(0);
         {error, Reason} ->
             io:format("error: ~p~n", [Reason]),
-            getopt:usage(?OPTS, atom_to_list(?MODULE)),
+            getopt:usage(OptSpecs, command_name(Action)),
             halt(1)
     end.
 
-parse_opts(Args) ->
-    case getopt:parse(?OPTS, Args) of
+parse_opts(Action, OptSpecs, Args) ->
+    case getopt:parse(OptSpecs, Args) of
         {ok, {Opts0, _}} ->
             Opts1 = maps:from_list(Opts0),
-            Opts2 = parse_ifaddrs(Opts1),
+            Opts2 = parse_ifaddrs(Action, OptSpecs, Opts1),
             Opts3 = parse_hosts(Opts2),
             {ok, Opts3};
         {error, Reason} ->
             io:format("error: ~p~n", [Reason]),
-            getopt:usage(?OPTS, atom_to_list(?MODULE)),
+            getopt:usage(OptSpecs, command_name(Action)),
             halt(1)
     end.
 
-parse_ifaddrs(#{ifaddrs := ""} = Opts) -> Opts;
-parse_ifaddrs(#{ifaddrs := IfAddrs} = Opts) ->
+command_name(Action) ->
+    atom_to_list(Action) ++ " " ++ atom_to_list(?MODULE).
+
+parse_ifaddrs(_Action, _OptSpecs, #{ifaddrs := ""} = Opts) ->
+    Opts;
+parse_ifaddrs(Action, OptSpecs, #{ifaddrs := IfAddrs} = Opts) ->
     IfAddrList0 = string:tokens(IfAddrs, ","),
     IfAddrList1 = lists:map(
         fun(IfAddr) ->
@@ -64,7 +98,7 @@ parse_ifaddrs(#{ifaddrs := IfAddrs} = Opts) ->
                     IpAddr;
                 {error, Reason} ->
                     io:format("bad ifaddr: ~p, error: ~p~n", [IfAddr, Reason]),
-                    getopt:usage(?OPTS, atom_to_list(?MODULE)),
+                    getopt:usage(OptSpecs, atom_to_list(Action) ++ " " ++ atom_to_list(?MODULE)),
                     halt(1)
             end
         end,
@@ -77,7 +111,11 @@ parse_hosts(Opts) ->
     Hosts1 = string:tokens(Hosts0, ","),
     Opts#{hosts => Hosts1}.
 
-run(Opts) ->
+%%--------------------------------------------------------------------
+%% Pub
+%%--------------------------------------------------------------------
+
+run_pub(Opts) ->
     Pid = start_provider(Opts),
 
     Consumers = lists:map(
@@ -94,7 +132,7 @@ run(Opts) ->
     halt(0).
 
 %%--------------------------------------------------------------------
-%% Provider
+%% Pub producers
 %%--------------------------------------------------------------------
 
 start_provider(Opts) ->
@@ -111,9 +149,14 @@ loop_docs(Ctx, Opts, DocId, DocIdEnd) when DocId =< DocIdEnd ->
     PartIdStart = maps:get(partid_start, Opts),
     PartIdEnd = maps:get(partid_end, Opts),
     loop_parts(Ctx, Opts, DocId, DocIdEnd, PartIdStart, PartIdEnd);
-loop_docs(#{
-    start_time := StartTime, total_count := TotalCount, done_count := DoneCount
-}, _Opts, _DocId, _DocIdEnd) ->
+loop_docs(
+    #{
+        start_time := StartTime, total_count := TotalCount, done_count := DoneCount
+    },
+    _Opts,
+    _DocId,
+    _DocIdEnd
+) ->
     CurrentTime = erlang:system_time(millisecond),
     TotalElapsedTimeSec = (CurrentTime - StartTime) div 1000,
     io:format("Finished ~p of ~p in ~ps~n", [
@@ -138,10 +181,16 @@ loop_parts(Ctx0, Opts, DocId, DocIdEnd, PartId, PartIdEnd) when PartId =< PartId
 loop_parts(Ctx, Opts, DocId, DocIdEnd, _PartIdStart, _PartIdEnd) ->
     loop_docs(Ctx, Opts, DocId + 1, DocIdEnd).
 
-update_ctx(Opts, #{
-    start_time := StartTime, period_start_time := PeriodStartTime, total_count := TotalCount,
-    period_left_count := PeriodLeftCount, done_count := DoneCount0
-} = Ctx) when PeriodLeftCount =< 1 ->
+update_ctx(
+    Opts,
+    #{
+        start_time := StartTime,
+        period_start_time := PeriodStartTime,
+        total_count := TotalCount,
+        period_left_count := PeriodLeftCount,
+        done_count := DoneCount0
+    } = Ctx
+) when PeriodLeftCount =< 1 ->
     CurrentTime = erlang:system_time(millisecond),
     PeriondElapsedTime = CurrentTime - PeriodStartTime,
     TotalElapsedTimeSec = (CurrentTime - StartTime) div 1000,
@@ -176,7 +225,7 @@ sleep(_Milliseconds) ->
     ok.
 
 %%--------------------------------------------------------------------
-%% Consumers
+%% Pub consumers
 %%--------------------------------------------------------------------
 
 start_consumer(Opts) ->
@@ -201,7 +250,9 @@ connect(Opts) ->
     ClientId = clientid(Opts),
     TCPOpts = tcp_opts(Opts),
     io:format("starting client ~p: ~p: ~p~n", [Host, Port, ClientId]),
-    {ok, Conn} = emqtt:start_link([{host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}]),
+    {ok, Conn} = emqtt:start_link([
+        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
+    ]),
     io:format("started client ~p: ~p: ~p~n", [Host, Port, ClientId]),
     {ok, _Result} = emqtt:connect(Conn),
     io:format("connected to ~p:~p as ~p~n", [Host, Port, ClientId]),
@@ -212,18 +263,20 @@ host(Opts) ->
     lists:nth(rand:uniform(length(Hosts)), Hosts).
 
 tcp_opts(Opts) ->
-    IpOpts = case Opts of
-        #{ifaddrs := []} ->
-            [];
-        #{ifaddrs := IfAddrs} ->
-            [{ip, lists:nth(rand:uniform(length(IfAddrs)), IfAddrs)}]
-    end,
-    BufOpts = case Opts of
-        #{lowmem := true} ->
-            [{recbuf, 64}, {sndbuf, 64}];
-        _ ->
-            []
-    end,
+    IpOpts =
+        case Opts of
+            #{ifaddrs := []} ->
+                [];
+            #{ifaddrs := IfAddrs} ->
+                [{ip, lists:nth(rand:uniform(length(IfAddrs)), IfAddrs)}]
+        end,
+    BufOpts =
+        case Opts of
+            #{lowmem := true} ->
+                [{recbuf, 64}, {sndbuf, 64}];
+            _ ->
+                []
+        end,
     IpOpts ++ BufOpts.
 
 clientid(Opts) ->
@@ -283,3 +336,136 @@ wait(Consumers) ->
         end,
         Consumers
     ).
+
+%%--------------------------------------------------------------------
+%% Pub producers
+%%--------------------------------------------------------------------
+
+run_sub(Opts) ->
+    _ = ets:new(sub_counters, [
+        public, named_table, set, {write_concurrency, true}, {read_concurrency, true}
+    ]),
+    Duration = maps:get(duration, Opts),
+    TotalDocuments = (maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1),
+    SubPerSec = TotalDocuments div Duration + 1,
+    Ctx = new_sub_ctx(SubPerSec, TotalDocuments, maps:get(docid_start, Opts)),
+    iterate_sub(Ctx, Opts),
+    halt(0).
+
+iterate_sub(#{done_count := DoneCount, total_count := TotalCount} = _Ctx, Opts) when
+    DoneCount >= TotalCount
+->
+    io:format("Finished ~p of ~p~n", [DoneCount, TotalCount]),
+    ok = print_sub_counters(Opts),
+    ok;
+iterate_sub(#{period_left_count := 0} = Ctx, Opts) ->
+    CurrentTime = erlang:system_time(millisecond),
+    PeriondElapsedTime = (CurrentTime - maps:get(period_start_time, Ctx)) div 1000,
+    ok = print_sub_counters(Opts),
+    sleep(1000 - PeriondElapsedTime),
+    Ctx1 = Ctx#{
+        period_start_time => erlang:system_time(millisecond),
+        period_left_count => maps:get(period_count, Ctx)
+    },
+    iterate_sub(Ctx1, Opts);
+iterate_sub(
+    #{period_left_count := PeriodLeftCount, done_count := DoneCount, current_docid := CurrentDocId} =
+        Ctx0,
+    Opts
+) ->
+    Ctx1 = Ctx0#{
+        period_left_count => PeriodLeftCount - 1,
+        done_count => DoneCount + 1,
+        current_docid => CurrentDocId + 1
+    },
+    ok = spawn_subscriber(Opts, CurrentDocId),
+    iterate_sub(Ctx1, Opts).
+
+new_sub_ctx(SubPerSec, TotalDocuments, CurrentDocId) ->
+    #{
+        period_start_time => erlang:system_time(millisecond),
+        period_count => SubPerSec,
+        period_left_count => SubPerSec,
+        done_count => 0,
+        total_count => TotalDocuments,
+        current_docid => CurrentDocId
+    }.
+
+spawn_subscriber(Opts, DocId) ->
+    _Pid = spawn_link(
+        fun() -> run_subscriber(Opts, DocId) end
+    ),
+    ok.
+
+run_subscriber(Opts, DocId) ->
+    inc_sub_counter(started),
+    Host = host(Opts),
+    Port = maps:get(port, Opts),
+    ClientId = clientid(Opts),
+    TCPOpts = tcp_opts(Opts),
+    {ok, Conn} = emqtt:start_link([
+        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
+    ]),
+    {ok, _Result} = emqtt:connect(Conn),
+    PartIdStart = maps:get(partid_start, Opts),
+    PartIdEnd = maps:get(partid_end, Opts),
+    lists:foreach(
+        fun(PartId) ->
+            Topic = format_topic(Opts, DocId, PartId),
+            {ok, _, _} = emqtt:subscribe(Conn, Topic, 1)
+        end,
+        lists:seq(PartIdStart, PartIdEnd)
+    ),
+    TimeToWait = maps:get(part_receive_timeout, Opts),
+    Deadline = erlang:system_time(millisecond) + TimeToWait,
+    wait_for_parts(Opts, Conn, PartIdEnd - PartIdStart + 1, Deadline).
+
+wait_for_parts(Opts, Conn, NLeft, Deadline) ->
+    Timeout = Deadline - erlang:system_time(millisecond),
+    case Timeout > 0 of
+        true ->
+            wait_for_part(Opts, Conn, NLeft, Timeout, Deadline);
+        false ->
+            inc_sub_counter(receive_timeout),
+            emqtt:disconnect(Conn)
+    end.
+
+wait_for_part(Opts, Conn, 0, _Timeout, _Deadline) ->
+    inc_sub_counter(received_all),
+    case maps:get(terminate_clients, Opts) of
+        true -> emqtt:disconnect(Conn);
+        false ->
+            erlang:hibernate(?MODULE, wake_up, [])
+    end;
+wait_for_part(Opts, Conn, NLeft, Timeout, Deadline) ->
+    receive
+        {publish, #{retain := true}} ->
+            wait_for_parts(Opts, Conn, NLeft - 1, Deadline)
+    after Timeout ->
+        inc_sub_counter(receive_timeout),
+        emqtt:disconnect(Conn)
+    end.
+
+wake_up() ->
+    io:format("waking up, shouldn't happen~n").
+
+print_sub_counters(_Opts) ->
+    io:format(
+        "clients started: ~p, clients received all parts: ~p, clients receive timeout: ~p, processes: ~p~n", [
+            get_sub_counter(started),
+            get_sub_counter(received_all),
+            get_sub_counter(receive_timeout),
+            erlang:system_info(process_count)
+        ]
+    ).
+
+inc_sub_counter(Name) ->
+    ets:update_counter(sub_counters, Name, 1, {Name, 0}).
+
+get_sub_counter(Name) ->
+    case ets:lookup(sub_counters, Name) of
+        [] ->
+            0;
+        [{Name, Value}] ->
+            Value
+    end.
