@@ -9,7 +9,7 @@
     {clientid_prefix, undefined, "clientid_prefix", {string, "mqtt_retain_bm"},
         "mqtt clientid prefix"},
     {clients, $c, "clients", {integer, 1}, "number of mqtt clients"},
-    {topic, $t, "topic", {string, "config/{docid}/{partid}"},
+    {topic, $t, "topic", {string, "{docid}/{partid}"},
         "mqtt topic pattern, {docid} and {partid} will be substituted"},
     {docid_start, undefined, "docid_start", {integer, 1}, "start of docid range"},
     {docid_end, undefined, "docid_end", {integer, 100}, "end of docid range"},
@@ -30,7 +30,7 @@
     {port, $p, "port", {integer, 1883}, "mqtt server port number"},
     {clientid_prefix, undefined, "clientid_prefix", {string, "mqtt_retain_bm"},
         "mqtt clientid prefix"},
-    {topic, $t, "topic", {string, "config/{docid}/{partid}"},
+    {topic, $t, "topic", {string, "{docid}/{partid}"},
         "mqtt topic pattern, {docid} and {partid} will be substituted"},
     {docid_start, undefined, "docid_start", {integer, 1}, "start of docid range"},
     {docid_end, undefined, "docid_end", {integer, 100}, "end of docid range"},
@@ -311,9 +311,14 @@ payload(Opts) ->
 
 format_topic(Opts, DocId, PartId) ->
     Topic0 = maps:get(topic, Opts),
-    Topic1 = string:replace(Topic0, "{docid}", integer_to_list(DocId)),
-    Topic2 = string:replace(Topic1, "{partid}", integer_to_list(PartId)),
+    Topic1 = substitute(Topic0, "{docid}", DocId),
+    Topic2 = substitute(Topic1, "{partid}", PartId),
     iolist_to_binary(Topic2).
+
+substitute(Template, Placehlder, Replacement) when is_list(Replacement) ->
+    string:replace(Template, Placehlder, Replacement);
+substitute(Template, Placehlder, Replacement) when is_integer(Replacement) ->
+    string:replace(Template, Placehlder, integer_to_list(Replacement)).
 
 request(Pid) ->
     Ref = make_ref(),
@@ -361,6 +366,7 @@ iterate_sub(#{done_count := DoneCount, total_count := TotalCount} = _Ctx, Opts) 
 iterate_sub(#{period_left_count := 0} = Ctx, Opts) ->
     CurrentTime = erlang:system_time(millisecond),
     PeriondElapsedTime = (CurrentTime - maps:get(period_start_time, Ctx)) div 1000,
+    ok = reap_dead_clients(Opts),
     ok = print_sub_counters(Opts),
     sleep(1000 - PeriondElapsedTime),
     Ctx1 = Ctx#{
@@ -391,8 +397,20 @@ new_sub_ctx(SubPerSec, TotalDocuments, CurrentDocId) ->
         current_docid => CurrentDocId
     }.
 
+reap_dead_clients(Opt) ->
+    receive
+        {'DOWN', _Ref, process, _Pid, normal} ->
+            reap_dead_clients(Opt);
+        {'DOWN', _Ref, process, _Pid, Reason} ->
+            io:format("subscriber dead: ~p~n", [Reason]),
+            inc_sub_counter(dead),
+            reap_dead_clients(Opt)
+    after 0 ->
+        ok
+    end.
+
 spawn_subscriber(Opts, DocId) ->
-    _Pid = spawn_link(
+    _ = spawn_monitor(
         fun() -> run_subscriber(Opts, DocId) end
     ),
     ok.
@@ -409,13 +427,8 @@ run_subscriber(Opts, DocId) ->
     {ok, _Result} = emqtt:connect(Conn),
     PartIdStart = maps:get(partid_start, Opts),
     PartIdEnd = maps:get(partid_end, Opts),
-    lists:foreach(
-        fun(PartId) ->
-            Topic = format_topic(Opts, DocId, PartId),
-            {ok, _, _} = emqtt:subscribe(Conn, Topic, 1)
-        end,
-        lists:seq(PartIdStart, PartIdEnd)
-    ),
+    Topic = format_topic(Opts, DocId, "+"),
+    {ok, _, _} = emqtt:subscribe(Conn, Topic, 1),
     TimeToWait = maps:get(part_receive_timeout, Opts),
     Deadline = erlang:system_time(millisecond) + TimeToWait,
     wait_for_parts(Opts, Conn, PartIdEnd - PartIdStart + 1, Deadline).
@@ -434,8 +447,7 @@ wait_for_part(Opts, Conn, 0, _Timeout, _Deadline) ->
     inc_sub_counter(received_all),
     case maps:get(terminate_clients, Opts) of
         true -> emqtt:disconnect(Conn);
-        false ->
-            erlang:hibernate(?MODULE, wake_up, [])
+        false -> erlang:hibernate(?MODULE, wake_up, [])
     end;
 wait_for_part(Opts, Conn, NLeft, Timeout, Deadline) ->
     receive
@@ -451,11 +463,12 @@ wake_up() ->
 
 print_sub_counters(_Opts) ->
     io:format(
-        "clients started: ~p, clients received all parts: ~p, clients receive timeout: ~p, processes: ~p~n", [
+        "clients started: ~p, clients received all parts: ~p, clients receive timeout: ~p, dead: ~p~n",
+        [
             get_sub_counter(started),
             get_sub_counter(received_all),
             get_sub_counter(receive_timeout),
-            erlang:system_info(process_count)
+            get_sub_counter(dead)
         ]
     ).
 
