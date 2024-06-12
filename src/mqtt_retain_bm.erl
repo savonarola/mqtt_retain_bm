@@ -116,6 +116,7 @@ parse_hosts(Opts) ->
 %%--------------------------------------------------------------------
 
 run_pub(Opts) ->
+    application:ensure_all_started(prometheus),
     Pid = start_provider(Opts),
 
     Consumers = lists:map(
@@ -343,13 +344,12 @@ wait(Consumers) ->
     ).
 
 %%--------------------------------------------------------------------
-%% Pub producers
+%% Sub
 %%--------------------------------------------------------------------
 
 run_sub(Opts) ->
-    _ = ets:new(sub_counters, [
-        public, named_table, set, {write_concurrency, true}, {read_concurrency, true}
-    ]),
+    application:ensure_all_started(prometheus),
+    declare_sub_metrics(),
     Duration = maps:get(duration, Opts),
     TotalDocuments = (maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1),
     SubPerSec = TotalDocuments div Duration + 1,
@@ -417,6 +417,9 @@ spawn_subscriber(Opts, DocId) ->
 
 run_subscriber(Opts, DocId) ->
     inc_sub_counter(started),
+    StartTime0 = erlang:system_time(microsecond),
+
+    %% connect
     Host = host(Opts),
     Port = maps:get(port, Opts),
     ClientId = clientid(Opts),
@@ -425,34 +428,40 @@ run_subscriber(Opts, DocId) ->
         {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
     ]),
     {ok, _Result} = emqtt:connect(Conn),
+    ok = observe_sub_latency(connect, StartTime0),
+
+    %% subscribe
     PartIdStart = maps:get(partid_start, Opts),
     PartIdEnd = maps:get(partid_end, Opts),
     Topic = format_topic(Opts, DocId, "+"),
+    StartTime1 = erlang:system_time(microsecond),
     {ok, _, _} = emqtt:subscribe(Conn, Topic, 1),
     TimeToWait = maps:get(part_receive_timeout, Opts),
     Deadline = erlang:system_time(millisecond) + TimeToWait,
-    wait_for_parts(Opts, Conn, PartIdEnd - PartIdStart + 1, Deadline).
+    wait_for_parts(Opts, Conn, StartTime1, Deadline, PartIdEnd - PartIdStart + 1, 0).
 
-wait_for_parts(Opts, Conn, NLeft, Deadline) ->
+wait_for_parts(Opts, Conn, StartTime, Deadline, TotalParts, RecevedParts) ->
     Timeout = Deadline - erlang:system_time(millisecond),
     case Timeout > 0 of
         true ->
-            wait_for_part(Opts, Conn, NLeft, Timeout, Deadline);
+            wait_for_part(Opts, Conn, StartTime, Timeout, Deadline, TotalParts, RecevedParts);
         false ->
             inc_sub_counter(receive_timeout),
             emqtt:disconnect(Conn)
     end.
 
-wait_for_part(Opts, Conn, 0, _Timeout, _Deadline) ->
+wait_for_part(Opts, Conn, StartTime, _Timeout, _Deadline, TotalParts, RecevedParts) when RecevedParts >= TotalParts ->
     inc_sub_counter(received_all),
+    observe_sub_latency(receive_all, StartTime),
     case maps:get(terminate_clients, Opts) of
         true -> emqtt:disconnect(Conn);
         false -> erlang:hibernate(?MODULE, wake_up, [])
     end;
-wait_for_part(Opts, Conn, NLeft, Timeout, Deadline) ->
+wait_for_part(Opts, Conn, StartTime, Timeout, Deadline, TotalParts, RecevedParts) ->
     receive
         {publish, #{retain := true}} ->
-            wait_for_parts(Opts, Conn, NLeft - 1, Deadline)
+            RecevedParts == 0 andalso observe_sub_latency(receive_first, StartTime),
+            wait_for_parts(Opts, Conn, StartTime, Deadline, TotalParts, RecevedParts + 1)
     after Timeout ->
         inc_sub_counter(receive_timeout),
         emqtt:disconnect(Conn)
@@ -461,24 +470,105 @@ wait_for_part(Opts, Conn, NLeft, Timeout, Deadline) ->
 wake_up() ->
     io:format("waking up, shouldn't happen~n").
 
+%%--------------------------------------------------------------------
+%% Metrics
+%%--------------------------------------------------------------------
+
+-define(COUNTER_METRICS, [
+    started,
+    received_all,
+    receive_timeout,
+    dead
+]).
+-define(LATENCY_METRICS, [
+    connect,
+    receive_first,
+    receive_all
+]).
+
+-define(LATENCY_BUCKETS, [
+    0.001,
+    0.002,
+    0.004,
+    0.01,
+    0.02,
+    0.04,
+    0.1,
+    0.2,
+    0.4,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0
+]).
+
+-define(PROMETHEUS_REGISTRY, ?MODULE).
+
+declare_sub_metrics() ->
+    ok = lists:foreach(
+        fun(Metric) ->
+            prometheus_counter:declare([
+                {name, Metric}, {registry, ?PROMETHEUS_REGISTRY}, {labels, []}, {help, ""}
+            ])
+        end,
+        ?COUNTER_METRICS
+    ),
+    ok = lists:foreach(
+        fun(Metric) ->
+            prometheus_histogram:declare([
+                {name, Metric},
+                {registry, ?PROMETHEUS_REGISTRY},
+                {buckets, ?LATENCY_BUCKETS},
+                {labels, []},
+                {help, ""}
+            ])
+        end,
+        ?LATENCY_METRICS
+    ).
+
 print_sub_counters(_Opts) ->
     io:format(
-        "clients started: ~p, clients received all parts: ~p, clients receive timeout: ~p, dead: ~p~n",
+        "clients started: ~p, clients received all parts: ~p, clients receive timeout: ~p, dead: ~p~n"
+        "connect latency: ~s~n"
+        "receive first latency: ~s~n"
+        "receive all latency: ~s~n",
         [
             get_sub_counter(started),
             get_sub_counter(received_all),
             get_sub_counter(receive_timeout),
-            get_sub_counter(dead)
+            get_sub_counter(dead),
+            format_latency(get_sub_latency(connect)),
+            format_latency(get_sub_latency(receive_first)),
+            format_latency(get_sub_latency(receive_all))
         ]
     ).
 
 inc_sub_counter(Name) ->
-    ets:update_counter(sub_counters, Name, 1, {Name, 0}).
+    _ = prometheus_counter:inc(?PROMETHEUS_REGISTRY, Name, [], 1),
+    ok.
+
+observe_sub_latency(Name, StartTimeUs) ->
+    LatencyUs = erlang:system_time(microsecond) - StartTimeUs,
+    _ = prometheus_histogram:observe(?PROMETHEUS_REGISTRY, Name, [], LatencyUs / 1_000_000),
+    ok.
 
 get_sub_counter(Name) ->
-    case ets:lookup(sub_counters, Name) of
-        [] ->
-            0;
-        [{Name, Value}] ->
-            Value
-    end.
+    prometheus_counter:value(?PROMETHEUS_REGISTRY, Name, []).
+
+get_sub_latency(Name) ->
+    prometheus_histogram:value(?PROMETHEUS_REGISTRY, Name, []).
+
+format_latency(Histogram) ->
+    {Counts, _} = Histogram,
+    lists:join(
+        ", ",
+        lists:map(
+            fun({Bucket, Count}) when is_list(Bucket) ->
+                io_lib:format("~s: ~p", [Bucket, Count]);
+               ({Bucket, Count}) ->
+                io_lib:format("~p: ~p", [Bucket, Count])
+            end,
+            lists:zip(?LATENCY_BUCKETS ++ ["..."], Counts)
+        )
+    ).
