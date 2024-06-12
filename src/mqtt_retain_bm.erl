@@ -44,6 +44,11 @@
     {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
     {terminate_clients, undefined, "terminate_clients", {boolean, false},
         "terminate clients after all parts received"},
+    {write_clients, undefined, "write_clients", {integer, 100},
+        "number of write clients to disrupt subscribers"},
+    {write_interval, undefined, "write_interval", {integer, 1800},
+        "average interval of disrupting writes per device in seconds"},
+    {payload_size, undefined, "payload_size", {integer, 8192}, "payload size in bytes for disruptors"},
     {help, $?, "help", {boolean, false}, "display this help message"}
 ]).
 
@@ -121,9 +126,7 @@ run_pub(Opts) ->
 
     Consumers = lists:map(
         fun(N) ->
-            ok = io:format("starting consumer ~p~n", [N]),
             Consumer = start_consumer(Opts#{n => N, provider_pid => Pid}),
-            ok = io:format("started consumer ~p~n", [N]),
             ok = timer:sleep(maps:get(start_interval, Opts)),
             Consumer
         end,
@@ -197,7 +200,7 @@ update_ctx(
     TotalElapsedTimeSec = (CurrentTime - StartTime) div 1000,
     DoneCount1 = DoneCount0 + 1,
     PPS = maps:get(pps, Opts),
-    io:format("[~p] Done ~p messages in ~pms; totally ~p of ~p in ~ps~n", [
+    io:format("[~p] done ~p messages in ~pms; totally ~p of ~p in ~ps~n", [
         CurrentTime, PPS, PeriondElapsedTime, DoneCount1, TotalCount, TotalElapsedTimeSec
     ]),
     sleep(1000 - PeriondElapsedTime),
@@ -244,45 +247,6 @@ start_consumer(Opts) ->
             end
         end
     ).
-
-connect(Opts) ->
-    Host = host(Opts),
-    Port = maps:get(port, Opts),
-    ClientId = clientid(Opts),
-    TCPOpts = tcp_opts(Opts),
-    io:format("starting client ~p: ~p: ~p~n", [Host, Port, ClientId]),
-    {ok, Conn} = emqtt:start_link([
-        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
-    ]),
-    io:format("started client ~p: ~p: ~p~n", [Host, Port, ClientId]),
-    {ok, _Result} = emqtt:connect(Conn),
-    io:format("connected to ~p:~p as ~p~n", [Host, Port, ClientId]),
-    Conn.
-
-host(Opts) ->
-    Hosts = maps:get(hosts, Opts),
-    lists:nth(rand:uniform(length(Hosts)), Hosts).
-
-tcp_opts(Opts) ->
-    IpOpts =
-        case Opts of
-            #{ifaddrs := []} ->
-                [];
-            #{ifaddrs := IfAddrs} ->
-                [{ip, lists:nth(rand:uniform(length(IfAddrs)), IfAddrs)}]
-        end,
-    BufOpts =
-        case Opts of
-            #{lowmem := true} ->
-                [{recbuf, 64}, {sndbuf, 64}];
-            _ ->
-                []
-        end,
-    IpOpts ++ BufOpts.
-
-clientid(Opts) ->
-    Prefix = maps:get(clientid_prefix, Opts),
-    Prefix ++ "_" ++ integer_to_list(erlang:unique_integer([positive])).
 
 consume(Opts, TotalCount) ->
     case send_next(Opts) of
@@ -349,7 +313,11 @@ wait(Consumers) ->
 
 run_sub(Opts) ->
     application:ensure_all_started(prometheus),
-    declare_sub_metrics(),
+    ok = declare_sub_metrics(),
+
+    Pid = start_sub_disrupt_provider(Opts),
+    ok = start_sub_disrupt_consumers(Opts, Pid),
+
     Duration = maps:get(duration, Opts),
     TotalDocuments = (maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1),
     SubPerSec = TotalDocuments div Duration + 1,
@@ -468,10 +436,74 @@ wait_for_part(Opts, Conn, StartTime, Timeout, Deadline, TotalParts, RecevedParts
     end.
 
 wake_up() ->
-    io:format("waking up, shouldn't happen~n").
+    drain_inbox(),
+    erlang:hibernate(?MODULE, wake_up, []).
+
+drain_inbox() ->
+    receive
+        _ -> drain_inbox()
+    after 0 ->
+        ok
+    end.
 
 %%--------------------------------------------------------------------
-%% Metrics
+%% These a writes parallel to subscriptions
+%%--------------------------------------------------------------------
+
+start_sub_disrupt_provider(Opts) ->
+    TotalDevices = maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1,
+    WriteIntensity = TotalDevices div maps:get(write_interval, Opts) + 1,
+    spawn_link(
+        fun() ->
+            loop(Opts, WriteIntensity)
+        end
+    ).
+
+loop(Opts, WriteIntensity) ->
+    StartTime = erlang:system_time(millisecond),
+    ok = loop_period(Opts, WriteIntensity),
+    CurrentTime = erlang:system_time(millisecond),
+    ElapsedTime = CurrentTime - StartTime,
+    io:format("finished ~p disrupting writes in ~pms~n", [WriteIntensity, ElapsedTime]),
+    sleep(1000 - ElapsedTime),
+    loop(Opts, WriteIntensity).
+
+loop_period(_Opts, 0) ->
+    ok;
+loop_period(Opts, NLeft) ->
+    DocId = rand_uniform(maps:get(docid_start, Opts), maps:get(docid_end, Opts)),
+    PartId = rand_uniform(maps:get(partid_start, Opts), maps:get(partid_end, Opts)),
+    receive
+        {get, Pid, Ref} ->
+            Pid ! {Ref, {DocId, PartId}}
+    end,
+    loop_period(Opts, NLeft - 1).
+
+start_sub_disrupt_consumers(Opts, ProvierPid) ->
+    lists:foreach(
+        fun(N) ->
+            start_sub_disrupt_consumer(Opts#{n => N, provider_pid => ProvierPid})
+        end,
+        lists:seq(1, maps:get(write_clients, Opts))
+    ).
+
+start_sub_disrupt_consumer(Opts) ->
+    Conn = connect(Opts),
+    spawn_link(
+        fun() ->
+            loop_sub_disrupt(Opts, Conn)
+        end
+    ).
+
+loop_sub_disrupt(Opts, Conn) ->
+    {DocId, PartId} = request(maps:get(provider_pid, Opts)),
+    Topic = format_topic(Opts, DocId, PartId),
+    Payload = payload(Opts),
+    {ok, _} = emqtt:publish(Conn, Topic, _Props = #{}, Payload, [{qos, 1}, {retain, true}]),
+    loop_sub_disrupt(Opts, Conn).
+
+%%--------------------------------------------------------------------
+%% Sub metrics
 %%--------------------------------------------------------------------
 
 -define(COUNTER_METRICS, [
@@ -572,3 +604,46 @@ format_latency(Histogram) ->
             lists:zip(?LATENCY_BUCKETS ++ ["..."], Counts)
         )
     ).
+
+%%--------------------------------------------------------------------
+%% Helpers
+%%--------------------------------------------------------------------
+
+rand_uniform(From, To) ->
+    From - 1 + rand:uniform(To - From + 1).
+
+connect(Opts) ->
+    Host = host(Opts),
+    Port = maps:get(port, Opts),
+    ClientId = clientid(Opts),
+    TCPOpts = tcp_opts(Opts),
+    {ok, Conn} = emqtt:start_link([
+        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
+    ]),
+    {ok, _Result} = emqtt:connect(Conn),
+    Conn.
+
+host(Opts) ->
+    Hosts = maps:get(hosts, Opts),
+    lists:nth(rand:uniform(length(Hosts)), Hosts).
+
+tcp_opts(Opts) ->
+    IpOpts =
+        case Opts of
+            #{ifaddrs := []} ->
+                [];
+            #{ifaddrs := IfAddrs} ->
+                [{ip, lists:nth(rand:uniform(length(IfAddrs)), IfAddrs)}]
+        end,
+    BufOpts =
+        case Opts of
+            #{lowmem := true} ->
+                [{recbuf, 64}, {sndbuf, 64}];
+            _ ->
+                []
+        end,
+    IpOpts ++ BufOpts.
+
+clientid(Opts) ->
+    Prefix = maps:get(clientid_prefix, Opts),
+    Prefix ++ "_" ++ integer_to_list(erlang:unique_integer([positive])).
