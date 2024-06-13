@@ -1,6 +1,6 @@
 -module(mqtt_retain_bm).
 
--export([main/1, wake_up/0]).
+-export([main/1, wakeup/0]).
 
 -define(PUB_OPTS, [
     {hosts, $h, "hosts", {string, "localhost"},
@@ -21,6 +21,7 @@
         "client start interval in milliseconds"},
     {ifaddrs, undefined, "ifaddrs", {string, ""}, "network interfaces address to bind"},
     {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
+    {keepalive, $k, "keepalive", {integer, 300}, "keep alive in seconds"},
     {help, $?, "help", {boolean, false}, "display this help message"}
 ]).
 
@@ -41,14 +42,33 @@
     {part_receive_timeout, undefined, "part_receive_timeout", {integer, 16000},
         "timeout to receive all parts of a document in milliseconds"},
     {ifaddrs, undefined, "ifaddrs", {string, ""}, "network interfaces address to bind"},
-    {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
+    {lowmem, undefined, "lowmem", {boolean, true}, "use low memory mode"},
     {terminate_clients, undefined, "terminate_clients", {boolean, false},
         "terminate clients after all parts received"},
-    {write_clients, undefined, "write_clients", {integer, 100},
+    {keepalive, $k, "keepalive", {integer, 300}, "keep alive in seconds"},
+    {help, $?, "help", {boolean, false}, "display this help message"}
+]).
+
+-define(SUB_OPTS_DISRUPT, [
+    {hosts, $h, "hosts", {string, "localhost"},
+        "mqtt server hostname or comma-separated hostnames"},
+    {port, $p, "port", {integer, 1883}, "mqtt server port number"},
+    {clientid_prefix, undefined, "clientid_prefix", {string, "mqtt_retain_bm"},
+        "mqtt clientid prefix"},
+    {topic, $t, "topic", {string, "{docid}/{partid}"},
+        "mqtt topic pattern, {docid} and {partid} will be substituted"},
+    {docid_start, undefined, "docid_start", {integer, 1}, "start of docid range"},
+    {docid_end, undefined, "docid_end", {integer, 100}, "end of docid range"},
+    {partid_start, undefined, "partid_start", {integer, 1}, "start of partid range"},
+    {partid_end, undefined, "partid_end", {integer, 16}, "end of partid range"},
+    {ifaddrs, undefined, "ifaddrs", {string, ""}, "network interfaces address to bind"},
+    {lowmem, undefined, "lowmem", {boolean, false}, "use low memory mode"},
+    {clients, $c, "clients", {integer, 100},
         "number of write clients to disrupt subscribers"},
-    {write_interval, undefined, "write_interval", {integer, 1800},
-        "average interval of disrupting writes per device in seconds"},
+    {pps, undefined, "pps", {integer, 1111},
+        "publish rate for disruptors"},
     {payload_size, undefined, "payload_size", {integer, 8192}, "payload size in bytes for disruptors"},
+    {keepalive, $k, "keepalive", {integer, 300}, "keep alive in seconds"},
     {help, $?, "help", {boolean, false}, "display this help message"}
 ]).
 
@@ -56,8 +76,10 @@ main(["pub" | Args]) ->
     with_parsed_options(pub, ?PUB_OPTS, Args, fun run_pub/1);
 main(["sub" | Args]) ->
     with_parsed_options(sub, ?SUB_OPTS, Args, fun run_sub/1);
+main(["sub_disrupt" | Args]) ->
+    with_parsed_options(sub, ?SUB_OPTS_DISRUPT, Args, fun run_sub_disrupt/1);
 main(_) ->
-    io:format("usage: ~p [pub|sub]~n", [?MODULE]),
+    io:format("usage: ~p [pub|sub|sub_disrupt]~n", [?MODULE]),
     halt(1).
 
 with_parsed_options(Action, OptSpecs, Args, Fun) ->
@@ -314,10 +336,6 @@ wait(Consumers) ->
 run_sub(Opts) ->
     application:ensure_all_started(prometheus),
     ok = declare_sub_metrics(),
-
-    Pid = start_sub_disrupt_provider(Opts),
-    ok = start_sub_disrupt_consumers(Opts, Pid),
-
     Duration = maps:get(duration, Opts),
     TotalDocuments = (maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1),
     SubPerSec = TotalDocuments div Duration + 1,
@@ -388,14 +406,7 @@ run_subscriber(Opts, DocId) ->
     StartTime0 = erlang:system_time(microsecond),
 
     %% connect
-    Host = host(Opts),
-    Port = maps:get(port, Opts),
-    ClientId = clientid(Opts),
-    TCPOpts = tcp_opts(Opts),
-    {ok, Conn} = emqtt:start_link([
-        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
-    ]),
-    {ok, _Result} = emqtt:connect(Conn),
+    Conn = connect(Opts),
     ok = observe_sub_latency(connect, StartTime0),
 
     %% subscribe
@@ -423,7 +434,7 @@ wait_for_part(Opts, Conn, StartTime, _Timeout, _Deadline, TotalParts, RecevedPar
     observe_sub_latency(receive_all, StartTime),
     case maps:get(terminate_clients, Opts) of
         true -> emqtt:disconnect(Conn);
-        false -> erlang:hibernate(?MODULE, wake_up, [])
+        false -> drain_inbox()
     end;
 wait_for_part(Opts, Conn, StartTime, Timeout, Deadline, TotalParts, RecevedParts) ->
     receive
@@ -435,24 +446,27 @@ wait_for_part(Opts, Conn, StartTime, Timeout, Deadline, TotalParts, RecevedParts
         emqtt:disconnect(Conn)
     end.
 
-wake_up() ->
-    drain_inbox(),
-    erlang:hibernate(?MODULE, wake_up, []).
-
 drain_inbox() ->
     receive
         _ -> drain_inbox()
     after 0 ->
-        ok
+        erlang:hibernate(?MODULE, wakeup, [])
     end.
 
+wakeup() ->
+    drain_inbox().
+
 %%--------------------------------------------------------------------
-%% These a writes parallel to subscriptions
+%% Disruptor
 %%--------------------------------------------------------------------
 
+run_sub_disrupt(Opts) ->
+    Pid = start_sub_disrupt_provider(Opts),
+    ok = start_sub_disrupt_consumers(Opts, Pid),
+    drain_inbox().
+
 start_sub_disrupt_provider(Opts) ->
-    TotalDevices = maps:get(docid_end, Opts) - maps:get(docid_start, Opts) + 1,
-    WriteIntensity = TotalDevices div maps:get(write_interval, Opts) + 1,
+    WriteIntensity = maps:get(pps, Opts),
     spawn_link(
         fun() ->
             loop(Opts, WriteIntensity)
@@ -484,7 +498,7 @@ start_sub_disrupt_consumers(Opts, ProvierPid) ->
         fun(N) ->
             start_sub_disrupt_consumer(Opts#{n => N, provider_pid => ProvierPid})
         end,
-        lists:seq(1, maps:get(write_clients, Opts))
+        lists:seq(1, maps:get(clients, Opts))
     ).
 
 start_sub_disrupt_consumer(Opts) ->
@@ -617,8 +631,11 @@ connect(Opts) ->
     Port = maps:get(port, Opts),
     ClientId = clientid(Opts),
     TCPOpts = tcp_opts(Opts),
+    KeepAlive = maps:get(keepalive, Opts),
+    LowerMem = maps:get(lowmem, Opts),
     {ok, Conn} = emqtt:start_link([
-        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}
+        {host, Host}, {port, Port}, {clientid, ClientId}, {tcp_opts, TCPOpts}, {keepalive, KeepAlive},
+        {low_mem, LowerMem}
     ]),
     {ok, _Result} = emqtt:connect(Conn),
     Conn.
