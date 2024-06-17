@@ -1,7 +1,7 @@
 REBAR ?= $(CURDIR)/rebar3
 REBAR_VERSION ?= 3.19.0-emqx-6
 ## managed by bumpversion-*
-VERSION=0.1.1
+VERSION=0.1.2
 
 REBAR_CMD = $(REBAR)
 
